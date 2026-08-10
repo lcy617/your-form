@@ -1,0 +1,103 @@
+// 相机编排 —— 让镜头"活"起来，制造真 3D 纵深与电影感
+//
+// 状态机：intro(对话期漂移) → gather(推进) → reveal(环绕展示) → farewell(后拉)
+// 用 lerp 平滑趋近目标位置/朝向，每帧由 SceneManager.render 链调用 update(dt)
+//
+// 设计：相机始终看向原点(0,0,0)（粒子形态中心），自身在球面上运动。
+// 每个状态定义目标距离/高度/角速度，update 里用阻尼趋近 + 持续环绕。
+
+import * as THREE from "three";
+import gsap from "gsap";
+
+export class CameraRig {
+  constructor(camera) {
+    this.camera = camera;
+    this._target = new THREE.Vector3(0, 0, 0);
+
+    // 当前相机在球面坐标（绕原点）
+    this.dist = 950;
+    this.height = 0;
+    this.angle = 0;          // 水平角
+    this.angleSpeed = 0;     // 角速度（弧度/秒）
+
+    // 目标值（lerp 趋近用）
+    this._tDist = 950;
+    this._tHeight = 0;
+    this._tAngleSpeed = 0.02;
+
+    // mouse parallax（轻量视差）
+    this._mx = 0;
+    this._my = 0;
+    this._tmx = 0;
+    this._tmy = 0;
+    this._onMove = (e) => {
+      const t = e.touches ? e.touches[0] : e;
+      this._tmx = (t.clientX / window.innerWidth - 0.5) * 2;
+      this._tmy = (t.clientY / window.innerHeight - 0.5) * 2;
+    };
+    window.addEventListener("mousemove", this._onMove, { passive: true });
+    window.addEventListener("touchmove", this._onMove, { passive: true });
+
+    this._sync();
+  }
+
+  // 切换状态：用 GSAP 做距离/高度的过渡，角速度直接设
+  setMode(mode) {
+    switch (mode) {
+      case "intro":
+        // 对话期：稍远，极缓漂移
+        gsap.to(this, { _tDist: 950, _tHeight: 40, duration: 2.5, ease: "power2.inOut" });
+        this._tAngleSpeed = 0.025;
+        break;
+      case "gather":
+        // 汇聚期：推进到中近距离
+        gsap.to(this, { _tDist: 720, _tHeight: 30, duration: 3.2, ease: "power2.inOut" });
+        this._tAngleSpeed = 0.05;
+        break;
+      case "reveal":
+        // 揭晓期：近距 + 较快环绕（money shot）
+        gsap.to(this, { _tDist: 600, _tHeight: 50, duration: 2.2, ease: "power2.out" });
+        this._tAngleSpeed = 0.12;
+        break;
+      case "farewell":
+        // 落幕期：后拉
+        gsap.to(this, { _tDist: 1200, _tHeight: 0, duration: 2.4, ease: "power2.inOut" });
+        this._tAngleSpeed = 0.03;
+        break;
+    }
+  }
+
+  update(dt) {
+    // 平滑趋近目标距离/高度
+    this.dist += (this._tDist - this.dist) * Math.min(1, dt * 1.6);
+    this.height += (this._tHeight - this.height) * Math.min(1, dt * 1.6);
+    this.angleSpeed += (this._tAngleSpeed - this.angleSpeed) * Math.min(1, dt * 1.2);
+
+    // 鼠标视差平滑
+    this._mx += (this._tmx - this._mx) * Math.min(1, dt * 2.5);
+    this._my += (this._tmy - this._my) * Math.min(1, dt * 2.5);
+
+    // 持续环绕
+    this.angle += this.angleSpeed * dt;
+
+    // 视差叠加在角度/高度上（小幅度）
+    const ang = this.angle + this._mx * 0.18;
+    const h = this.height + this._my * 50;
+
+    this.camera.position.x = Math.sin(ang) * this.dist;
+    this.camera.position.z = Math.cos(ang) * this.dist;
+    this.camera.position.y = h;
+    this.camera.lookAt(this._target);
+  }
+
+  dispose() {
+    window.removeEventListener("mousemove", this._onMove);
+    window.removeEventListener("touchmove", this._onMove);
+    gsap.killTweensOf(this);
+  }
+
+  _sync() {
+    this.camera.position.set(0, this.height, this.dist);
+    this.camera.lookAt(this._target);
+  }
+}
