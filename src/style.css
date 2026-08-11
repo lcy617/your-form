@@ -132,6 +132,19 @@ body.gathering .bg-aura {
   text-shadow: 0 0 30px rgba(201, 168, 76, 0.4), 0 0 12px rgba(0, 0, 0, 0.85);
 }
 
+/* 思考占位台词：柔和、带呼吸感透明度变化，暗示"正在想" */
+.dialogue.thinking {
+  font-size: clamp(18px, 3.6vw, 26px);
+  color: rgba(236, 233, 226, 0.65);
+  font-style: italic;
+  letter-spacing: 0.1em;
+  animation: thinkingBreath 2.4s ease-in-out infinite;
+}
+@keyframes thinkingBreath {
+  0%, 100% { opacity: 0.85; }
+  50% { opacity: 0.45; }
+}
+
 /* —— 输入区 —— */
 .input-wrap {
   margin-top: 36px;

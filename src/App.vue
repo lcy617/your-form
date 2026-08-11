@@ -51,6 +51,8 @@ function act2AskName() {
     .then((name) => {
       const n = name || "旅人";
       answers.name = n;
+      // 提交后立刻 thinking 占位，避免 AI.greet 期间舞台空白像卡死
+      stage.thinking("……" + n + "，让我看看你");
       return AI.greet(n).then((greet) =>
         stage.clear().then(() => stage.say(greet))
       );
@@ -68,11 +70,15 @@ function act3Questions() {
         if (idx === 1) answers.q2 = ans;
         if (idx === 2) answers.q3 = ans;
         if (idx === 3) answers.q4 = ans;
-        if (q.react) {
-          return stage.clear().then(() =>
-            stage.say(q.react, { speed: 90, hold: 700 })
-          );
-        }
+        // 提交后 thinking 占位，让问答之间有"正在感受"的节奏（不再瞬切）
+        stage.thinking("嗯……");
+        return stage.wait(1100).then(() => {
+          if (q.react) {
+            return stage.clear().then(() =>
+              stage.say(q.react, { speed: 90, hold: 700 })
+            );
+          }
+        });
       });
   }, Promise.resolve());
 }
@@ -89,12 +95,15 @@ function act4Gather() {
       const isMobile = matchMedia("(hover: none) and (pointer: coarse)").matches;
       const n = isMobile ? 2600 : 5000;
       particles.spawn(n);
-      // 同时请求 AI
+      // thinking 占位：AI 思考期间粒子在预演收缩，台词在"正在读懂你"
+      stage.thinking("好……正在读懂你");
+      // 同时请求 AI（推理模型可能 5-15s，期间 thinking + 粒子预演撑场）
       return AI.reveal(answers);
     })
     .then((reveal) => {
       revealResult = reveal;
-      return stage.wait(2800);
+      // AI 返回后立刻 clear 中断 thinking，进 act5
+      return stage.clear();
     });
 }
 
@@ -106,15 +115,17 @@ function act5Reveal() {
   const form = generateForm(archetype, n, hue, energy);
 
   stage.gather(false);
-  sm.setCameraMode("reveal");
-  particles.formTo(form);
+  // 台词优先：先开始打揭晓台词，让用户第一时间"被读懂"
+  // 同时粒子开始汇聚（视觉与文字同步展开）
+  sm.setCameraMode("reveal", archetype);
+  particles.formTo(form, archetype);
+  const sayPromise = stage.say(line, { reveal: true, speed: 55, hold: 999999 });
 
-  return stage
-    .wait(3000)
-    .then(() =>
-      stage.say(line, { reveal: true, speed: 55, hold: 999999 })
-    )
-    .then(() => stage.wait(5200));
+  // 等汇聚真正完成（formTo 单粒子最长 delay~1.15 + dur 3.0 ≈ 4.2s）
+  // 台词打字通常 3-5s（25 字 × 55ms），两者并行
+  return Promise.all([sayPromise, stage.wait(4200)]).then(() =>
+    stage.wait(5000)
+  );
 }
 
 function act6Farewell() {

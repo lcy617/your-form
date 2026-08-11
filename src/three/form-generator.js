@@ -106,7 +106,7 @@ function genVortex(count, hue, energy) {
     const spiral = t * turns * Math.PI * 2;
     const jitter = (Math.random() - 0.5) * 0.5; // 臂的宽度
     const ang = baseAng + spiral + jitter;
-    const yJitter = gaussian() * R * 0.08; // 盘很薄
+    const yJitter = gaussian() * R * 0.15; // 盘厚（加厚让双臂在 3D 中更易辨）
     positions[i * 3] = Math.cos(ang) * r;
     positions[i * 3 + 1] = yJitter;
     positions[i * 3 + 2] = Math.sin(ang) * r;
@@ -131,7 +131,7 @@ function genBloom(count, hue, energy) {
     const theta = Math.random() * Math.PI * 2; // 绕 y
     const phi = Math.acos(2 * Math.random() - 1); // 极角 0~π
     // 花瓣调制：在赤道附近(phi≈π/2)最强，两极收
-    const petalMod = 0.65 + 0.35 * Math.abs(Math.sin(theta * petals) * Math.sin(phi));
+    const petalMod = 0.55 + 0.45 * Math.abs(Math.sin(theta * petals) * Math.sin(phi));
     const r = R * petalMod * (0.85 + Math.random() * 0.15);
     positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
     positions[i * 3 + 1] = r * Math.cos(phi);
@@ -246,7 +246,7 @@ function genAurora(count, hue, energy) {
   for (let i = 0; i < count; i++) {
     const x = gaussian() * R * 0.55;
     const waveZ = Math.sin((x / R) * Math.PI * 2 * waves) * amp;
-    const yJitter = gaussian() * R * 0.18;
+    const yJitter = gaussian() * R * 0.10; // 降低 y 抖动，别糊掉波浪
     const zJitter = gaussian() * R * 0.08;
     positions[i * 3] = x;
     positions[i * 3 + 1] = yJitter;

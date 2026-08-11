@@ -42,7 +42,8 @@ export class CameraRig {
   }
 
   // 切换状态：用 GSAP 做距离/高度的过渡，角速度直接设
-  setMode(mode) {
+  // reveal 模式可传 archetype，按原型差异化镜头（展示各自最有辨识度的角度）
+  setMode(mode, archetype) {
     switch (mode) {
       case "intro":
         // 对话期：稍远，极缓漂移
@@ -54,11 +55,40 @@ export class CameraRig {
         gsap.to(this, { _tDist: 720, _tHeight: 30, duration: 3.2, ease: "power2.inOut" });
         this._tAngleSpeed = 0.05;
         break;
-      case "reveal":
-        // 揭晓期：近距 + 较快环绕（money shot）
-        gsap.to(this, { _tDist: 600, _tHeight: 50, duration: 2.2, ease: "power2.out" });
-        this._tAngleSpeed = 0.12;
+      case "reveal": {
+        // 揭晓期：按原型调相机，展示各自最有辨识度的角度
+        let dist = 600, height = 50, speed = 0.12;
+        switch (archetype) {
+          case "cascade":
+            // 瀑布纵向：拉远 + 略低视角，展示高度落差
+            dist = 780; height = -40; speed = 0.06;
+            break;
+          case "aurora":
+            // 极光波浪：俯视，展示 z 方向的波浪起伏
+            dist = 700; height = 280; speed = 0.07;
+            break;
+          case "crystal":
+            // 晶格：加速旋转，绕一圈展示所有棱角
+            dist = 640; height = 30; speed = 0.22;
+            break;
+          case "vortex":
+            // 漩涡：侧斜俯视，看双臂螺旋
+            dist = 680; height = 180; speed = 0.1;
+            break;
+          case "bloom":
+            // 绽放：正视稍俯，看花瓣开合
+            dist = 620; height = 120; speed = 0.09;
+            break;
+          case "nebula":
+          default:
+            // 星云：标准环绕
+            dist = 600; height = 50; speed = 0.12;
+            break;
+        }
+        gsap.to(this, { _tDist: dist, _tHeight: height, duration: 2.2, ease: "power2.out" });
+        this._tAngleSpeed = speed;
         break;
+      }
       case "farewell":
         // 落幕期：后拉
         gsap.to(this, { _tDist: 1200, _tHeight: 0, duration: 2.4, ease: "power2.inOut" });
