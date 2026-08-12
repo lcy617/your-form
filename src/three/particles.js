@@ -1,35 +1,66 @@
-// 粒子系统（真 3D + 自定义 ShaderMaterial）
+// 粒子系统 v4 —— teamLab 风格"活生态"
 //
-// v3 重写要点：
-//   - 真 3D 位置（z 有深度），透视相机下有纵深感
-//   - 自定义着色器：软圆点 + 亮核 + 透视尺寸衰减（取代 PointsMaterial + glowTexture）
-//   - ambient 星场：对话期就有的多深度漂浮星点（解决"前几幕零粒子"的单调）
-//   - 主粒子云：spawn(涌入) → formTo(螺旋编织汇聚到 3D 形态) → breathe(呼吸) → disperse(3D 消散)
-//   - 鼠标视差交给 CameraRig，这里不再处理鼠标
+// 根治转变:从"六个静态原型点云，汇聚后呼吸(死)"→"curl noise 流场驱动的活生命体"
+//   - 位置:curl noise 流场每帧 advect + 弱回归(围绕锚点)+ 鼠标局部排斥(teamLab 式响应人)
+//   - 生灭:每粒子 life 周期(淡入→盛→淡出→重生),像萤火虫明灭 / 花开花谢
+//   - 基因:连续参数(flowSpeed/density/stability/huePrimary/hueSecondary/growthBias)驱动流速/聚集/稳定/色场/生长
+//           每个人独一无二;archetype 退化为气质标签,只微调基因偏置,不再驱动几何
+//   - 鼠标:camera-rig 与本系统都从 lib/input.js 读,避免两套 window 监听
 //
-// 数据契约：每粒子一条 data：{x,y,z, tx,ty,tz, bx,by,bz(呼吸锚点), sx,sy,sz(螺旋中间量), vx,vy,vz, alpha, targetAlpha, size, seed, color{r,g,b}, delay, formT}
+// 对外接口(保留,App.vue 依赖):spawn / formTo / tintHue / disperse / leaveOneBack / clear / update / hasParticles / dispose
 import * as THREE from "three";
 import gsap from "gsap";
 import { PARTICLE_VERT, PARTICLE_FRAG } from "./shaders.js";
+import { hslToRgb } from "../lib/color.js";
+import { curl } from "../lib/noise.js";
+import { Input } from "../lib/input.js";
+
+// —— 默认基因(阶段 A:未接 AI 时用;B 阶段由 ai.js reveal 提供,C 阶段各 act 累积改变) —— //
+const DEFAULT_GENES = {
+  flowSpeed: 1.0,      // 流速倍率 0.3~2.0:快=激昂/焦虑,慢=沉静
+  density: 0.55,       // 聚集度 0~1:高=致密团,低=稀疏散
+  stability: 0.6,      // 稳定度 0~1:高=沉稳少飘,低=飘忽多变
+  huePrimary: 210,     // 主色相
+  hueSecondary: 280,   // 辅色相(主+辅做色彩层次,告别单色廉价感)
+  saturation: 0.6,
+  growthBias: 0,       // 生长偏向:<0 下沉,>0 上升
+};
+
+// archetype → 基因偏置(保留气质标签;不驱动几何,只让每种心境有不同生命感)
+const ARCHETYPE_GENES = {
+  nebula:  { flowSpeed: 0.7, density: 0.6,  stability: 0.7 },
+  vortex:  { flowSpeed: 1.5, density: 0.5,  stability: 0.3 },
+  bloom:   { flowSpeed: 0.9, density: 0.65, stability: 0.6 },
+  cascade: { flowSpeed: 1.1, density: 0.4,  stability: 0.35 },
+  crystal: { flowSpeed: 0.4, density: 0.7,  stability: 0.85 },
+  aurora:  { flowSpeed: 1.3, density: 0.45, stability: 0.4 },
+};
 
 export class Particles {
   constructor(sceneMgr) {
     this.sm = sceneMgr;
-    this.points = null; // 主粒子云 THREE.Points
+    this.points = null;
     this.geo = null;
     this.mat = null;
     this.data = [];
-    this.mode = "idle";
     this.time = 0;
-    this.archetype = "nebula"; // 当前形态原型（formTo 时设置），驱动特征运动
+    this.mode = "idle";
 
-    // ambient 星场（独立 Points，常驻）
-    this._ambient = null;
+    this.genes = { ...DEFAULT_GENES };
+    this.anchor = new THREE.Vector3(0, 0, 0);
+    this._formBlend = 0;            // 0=自由流场,1=围绕锚点致密成型
+    this._formBlendTween = null;
+    this._dispersing = false;
+
+    this._mouseWorld = new THREE.Vector3();
+    this._mouseActive = false;
+    this._ambientTint = null;
+    this._tmp = [0, 0, 0];
 
     this._spawnAmbient();
   }
 
-  // —— ambient 星场：对话期就有的背景星点 —— //
+  // —— ambient 星场(保留:常驻背景星点,对话期就有,不参与流场) —— //
   _spawnAmbient() {
     const isMobile = matchMedia("(hover: none) and (pointer: coarse)").matches;
     const n = isMobile ? 320 : 700;
@@ -38,47 +69,36 @@ export class Particles {
     const sizes = new Float32Array(n);
     const alphas = new Float32Array(n);
     const seeds = new Float32Array(n);
-
-    // 暖金/冷蓝/暖红 三色微弱星点
     const palette = [
       [0.85, 0.78, 0.55],
       [0.5, 0.65, 0.9],
       [0.85, 0.6, 0.6],
     ];
-
     for (let i = 0; i < n; i++) {
-      // 散布在很大的球壳内，制造多深度
       const r = 400 + Math.random() * 1600;
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.acos(2 * Math.random() - 1);
       positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
       positions[i * 3 + 1] = r * Math.cos(phi);
       positions[i * 3 + 2] = r * Math.sin(phi) * Math.sin(theta);
-
       const c = palette[Math.floor(Math.random() * palette.length)];
-      colors[i * 3] = c[0];
-      colors[i * 3 + 1] = c[1];
-      colors[i * 3 + 2] = c[2];
-
+      colors[i * 3] = c[0]; colors[i * 3 + 1] = c[1]; colors[i * 3 + 2] = c[2];
       sizes[i] = 4 + Math.random() * 10;
       alphas[i] = 0.15 + Math.random() * 0.45;
       seeds[i] = Math.random();
     }
-
     const geo = new THREE.BufferGeometry();
     geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
     geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
     geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
     geo.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
     geo.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
-
     const mat = this._makeMaterial(0.5, 0.12);
     const pts = new THREE.Points(geo, mat);
     this.sm.scene.add(pts);
     this._ambient = { points: pts, geo, mat };
   }
 
-  // —— 共享的自定义材质工厂 —— //
   _makeMaterial(sizeScale, coreBoost) {
     return new THREE.ShaderMaterial({
       uniforms: {
@@ -97,7 +117,7 @@ export class Particles {
     });
   }
 
-  // —— 生成 n 个主粒子（从远处球壳涌入）—— //
+  // —— 初始化主粒子云:散布在生态范围内 + life 错相淡入(萤火虫一只只亮起,而非从远涌入) —— //
   spawn(n) {
     this._disposeMesh();
     const positions = new Float32Array(n * 3);
@@ -107,47 +127,30 @@ export class Particles {
     const seeds = new Float32Array(n);
     this.data = [];
 
+    const R = 280;
     for (let i = 0; i < n; i++) {
-      // 从远处球壳涌入（多方向，z 有深度）
-      const r = 1400 + Math.random() * 600;
+      const r = Math.cbrt(Math.random()) * R;
       const theta = Math.random() * Math.PI * 2;
       const phi = Math.acos(2 * Math.random() - 1);
       const x = r * Math.sin(phi) * Math.cos(theta);
       const y = r * Math.cos(phi);
       const z = r * Math.sin(phi) * Math.sin(theta);
-
-      positions[i * 3] = x;
-      positions[i * 3 + 1] = y;
-      positions[i * 3 + 2] = z;
-
-      // 临时中性色，formTo 时会被目标色覆盖
-      colors[i * 3] = 0.7;
-      colors[i * 3 + 1] = 0.7;
-      colors[i * 3 + 2] = 0.7;
-
-      sizes[i] = 7 + Math.random() * 16;
-      alphas[i] = 0;
+      positions[i * 3] = x; positions[i * 3 + 1] = y; positions[i * 3 + 2] = z;
+      sizes[i] = 6 + Math.random() * 14;
       seeds[i] = Math.random();
-
       this.data.push({
         x, y, z,
-        tx: 0, ty: 0, tz: 0,     // 目标
-        bx: 0, by: 0, bz: 0,     // 呼吸锚点
-        vx: 0, vy: 0, vz: 0,     // 速度
-        alpha: 0,
-        targetAlpha: 0.65 + Math.random() * 0.35,
+        vx: 0, vy: 0, vz: 0,
         size: sizes[i],
-        seed: Math.random() * Math.PI * 2,
+        seed: seeds[i] * Math.PI * 2,
+        life: Math.random(),
+        lifeSpeed: 0.18 + Math.random() * 0.14,
+        maxAlpha: 0.5 + Math.random() * 0.5,
         color: { r: 0.7, g: 0.7, b: 0.7 },
-        hasTarget: false,
-        // 螺旋汇聚用
-        delay: 0,
-        formT: 0,            // 0→1 汇聚进度
-        startAng: 0,
-        targetAng: 0,
-        startR: r,
-        targetR: 0,
+        useSec: Math.random() < 0.3,        // 30% 用辅色,做色彩层次
+        curlOffset: Math.random() * 100,    // 流场个体偏移,让每粒子轨迹不同
       });
+      alphas[i] = 1;
     }
 
     this.geo = new THREE.BufferGeometry();
@@ -160,109 +163,161 @@ export class Particles {
     this.mat = this._makeMaterial(1.0, 0.25);
     this.points = new THREE.Points(this.geo, this.mat);
     this.sm.scene.add(this.points);
-    this.mode = "gather";
+    this.mode = "alive";
+    this._formBlend = 0;
+    this._dispersing = false;
+    this._applyColors();
+  }
 
-    // 涌入：alpha 渐显 + 向中心区域缓流
-    for (const d of this.data) {
-      gsap.to(d, { alpha: d.targetAlpha, duration: 1.8, ease: "power2.out", delay: Math.random() * 0.6 });
+  // —— 按当前基因重算每粒子颜色(主/辅双色 + 抖动) —— //
+  _applyColors() {
+    if (!this.data.length) return;
+    const g = this.genes;
+    for (let i = 0; i < this.data.length; i++) {
+      const d = this.data[i];
+      const hue = d.useSec ? g.hueSecondary : g.huePrimary;
+      const h = hue + (Math.random() - 0.5) * 18;
+      const s = Math.min(1, g.saturation * (0.8 + Math.random() * 0.3));
+      const l = 0.5 + Math.random() * 0.2;
+      const [r, gg, b] = hslToRgb(h, s, l);
+      d.color.r = r; d.color.g = gg; d.color.b = b;
     }
   }
 
-  // —— 汇聚到目标形态（formT 驱动真插值，清掉旧的死代码螺旋）—— //
-  // form 是 { positions: Float32Array(3n), colors: Float32Array(3n) }
-  // archetype 用于 update() 的特征运动分发
-  formTo(form, archetype) {
-    const fpos = form.positions;
-    const fcol = form.colors;
-    const n = Math.min(this.data.length, fpos.length / 3);
-    if (n === 0) return;
-    this.archetype = archetype || "nebula";
+  // —— 设基因(B 阶段 AI 调,C 阶段各 act 累积调);色场变了自动重染 —— //
+  setGenes(partial) {
+    Object.assign(this.genes, partial);
+    if (partial.huePrimary !== undefined || partial.hueSecondary !== undefined || partial.saturation !== undefined) {
+      this._applyColors();
+    }
+  }
 
-    // 收集目标点并按距原点排序
-    const targets = [];
-    for (let i = 0; i < n; i++) {
-      const tx = fpos[i * 3], ty = fpos[i * 3 + 1], tz = fpos[i * 3 + 2];
-      targets.push({
-        x: tx, y: ty, z: tz,
-        r: Math.hypot(tx, ty, tz),
-        idx: i,
+  // —— 即时染色(act3 颜色题兼容接口):ambient 渐染 + 主云改色场基因 —— //
+  tintHue(hue, dur = 1.6) {
+    if (typeof hue !== "number" || !isFinite(hue)) return;
+
+    // ambient 星场染色(保留:单 tween 驱动进度,重入安全)
+    if (this._ambient) {
+      const colAttr = this._ambient.geo.attributes.color;
+      const arr = colAttr.array;
+      const n = arr.length / 3;
+      if (this._ambientTint) { gsap.killTweensOf(this._ambientTint); this._ambientTint = null; }
+      const from = new Float32Array(n * 3);
+      const to = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) {
+        from[i * 3] = arr[i * 3]; from[i * 3 + 1] = arr[i * 3 + 1]; from[i * 3 + 2] = arr[i * 3 + 2];
+        const h = hue + (Math.random() - 0.5) * 18;
+        const s = 0.45 + Math.random() * 0.2;
+        const l = 0.6 + Math.random() * 0.2;
+        const [r, gg, b] = hslToRgb(h, s, l);
+        to[i * 3] = r; to[i * 3 + 1] = gg; to[i * 3 + 2] = b;
+      }
+      const prog = { t: 0 };
+      this._ambientTint = prog;
+      gsap.to(prog, {
+        t: 1, duration: dur, ease: "power2.out",
+        onUpdate: () => { for (let j = 0; j < n * 3; j++) arr[j] = from[j] + (to[j] - from[j]) * prog.t; colAttr.needsUpdate = true; },
+        onComplete: () => { this._ambientTint = null; },
       });
     }
 
-    // 远粒子去远目标，制造有序汇聚
-    const orderedData = [...this.data].sort((a, b) => {
-      const da = Math.hypot(a.x, a.y, a.z);
-      const db = Math.hypot(b.x, b.y, b.z);
-      return db - da;
+    // 主云:改色场基因(主色=用户颜色,辅色 +60° 做层次,告别单色廉价)
+    this.genes.huePrimary = hue;
+    this.genes.hueSecondary = (hue + 60) % 360;
+    this._applyColors();
+  }
+
+  // —— 成型(act5):接收完整 reveal,AI 生长基因优先 + archetype 偏置兜底 + 渐进致密成型 —— //
+  formTo(reveal) {
+    const ag = ARCHETYPE_GENES[reveal.archetype] || ARCHETYPE_GENES.nebula;
+    this.setGenes({
+      flowSpeed: reveal.flowSpeed ?? ag.flowSpeed,
+      density: reveal.density ?? ag.density,
+      stability: reveal.stability ?? ag.stability,
+      huePrimary: reveal.huePrimary ?? this.genes.huePrimary,
+      hueSecondary: reveal.hueSecondary ?? this.genes.hueSecondary,
+      growthBias: reveal.growthBias ?? 0,
+      saturation: reveal.saturation ?? this.genes.saturation,
     });
-    targets.sort((a, b) => b.r - a.r);
-
-    this._formStart = this.time;
-    const dur = 3.0;
-
-    for (let k = 0; k < n; k++) {
-      const d = orderedData[k];
-      const t = targets[k];
-      // 记录起点（汇聚插值用）
-      d.sx = d.x; d.sy = d.y; d.sz = d.z;
-      // 目标 = 呼吸锚点
-      d.tx = t.x; d.ty = t.y; d.tz = t.z;
-      d.bx = t.x; d.by = t.y; d.bz = t.z;
-      // 存极坐标（特征运动用：旋转/花瓣/波浪需要）
-      d.baseR = t.r;
-      d.baseAng = Math.atan2(t.z, t.x);   // xz 平面角
-      d.basePhi = Math.acos(THREE.MathUtils.clamp(t.y / (t.r || 1), -1, 1)); // 极角
-      // 目标颜色
-      const ci = t.idx;
-      d.color.r = fcol[ci * 3];
-      d.color.g = fcol[ci * 3 + 1];
-      d.color.b = fcol[ci * 3 + 2];
-
-      d.hasTarget = true;
-      d.delay = THREE.MathUtils.clamp(t.r / 260, 0, 1) * 0.9 + Math.random() * 0.25;
-      d.formT = 0;
-
-      gsap.to(d, {
-        formT: 1,
-        duration: dur,
-        ease: "power2.inOut",
-        delay: d.delay,
-      });
-      gsap.to(d, { alpha: Math.min(1, d.targetAlpha + 0.15), duration: dur, ease: "power2.out", delay: d.delay });
-    }
-
+    this.anchor.set(0, 0, 0);
+    this._dispersing = false;
+    if (this._formBlendTween) gsap.killTweensOf(this);
+    this._formBlendTween = gsap.to(this, { _formBlend: 1, duration: 3, ease: "power2.inOut" });
     this.mode = "form";
   }
 
-  // —— 消散（3D 向外飞散 + 淡出）—— //
+  // —— 消散(act6):关回归 + 离心外飘 + life 加速 + maxAlpha 衰减(有机凋落,非死板飞散) —— //
   disperse() {
     this.mode = "disperse";
-    for (const d of this.data) {
-      const len = Math.hypot(d.x, d.y, d.z) || 1;
-      // 沿径向加速外飞，加随机扰动
-      const ux = d.x / len, uy = d.y / len, uz = d.z / len;
-      const sp = 250 + Math.random() * 500;
-      gsap.to(d, {
-        x: d.x + ux * sp + (Math.random() - 0.5) * 200,
-        y: d.y + uy * sp + (Math.random() - 0.5) * 200,
-        z: d.z + uz * sp + (Math.random() - 0.5) * 200,
-        alpha: 0,
-        duration: 2.4,
-        ease: "power2.in",
-        delay: Math.random() * 0.5,
-      });
-      d.hasTarget = false;
-    }
+    this._dispersing = true;
+    if (this._formBlendTween) gsap.killTweensOf(this);
+    this._formBlendTween = gsap.to(this, { _formBlend: 0, duration: 1, ease: "power2.out" });
   }
 
   clear() {
     this._disposeMesh();
+    this._clearLeftBehind();
     this.data = [];
     this.mode = "idle";
+    this._formBlend = 0;
+    this._dispersing = false;
+    if (this._formBlendTween) { gsap.killTweensOf(this); this._formBlendTween = null; }
+  }
+
+  // —— 余韵:告别时留一小簇在原地缓慢闪烁(保留;呼应"他留下了什么") —— //
+  leaveOneBack(hue) {
+    this._clearLeftBehind();
+    const isMobile = matchMedia("(hover: none) and (pointer: coarse)").matches;
+    let px = 0, py = 30, pz = 0;
+    if (this.data.length > 0) {
+      const d = this.data[0];
+      px = d.x * 0.3; py = d.y * 0.3 + 20; pz = d.z * 0.3;
+    }
+    const h = (typeof hue === "number" && isFinite(hue)) ? hue : 210;
+    const [r, g, b] = hslToRgb(h, 0.6, 0.7);
+    const n = isMobile ? 6 : 10;
+    const positions = new Float32Array(n * 3);
+    const colors = new Float32Array(n * 3);
+    const sizes = new Float32Array(n);
+    const alphas = new Float32Array(n);
+    const seeds = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const spread = 18;
+      positions[i * 3] = px + (Math.random() - 0.5) * spread;
+      positions[i * 3 + 1] = py + (Math.random() - 0.5) * spread;
+      positions[i * 3 + 2] = pz + (Math.random() - 0.5) * spread;
+      colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
+      sizes[i] = 10 + Math.random() * 8;
+      alphas[i] = 0.7 + Math.random() * 0.3;
+      seeds[i] = Math.random();
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+    geo.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+    geo.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
+    geo.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+    const mat = this._makeMaterial(1.0, 0.4);
+    const pts = new THREE.Points(geo, mat);
+    this.sm.scene.add(pts);
+    this._leftBehind = { points: pts, geo, mat, baseHue: h };
+    this._leftBehindPhase = 0;
+  }
+
+  _clearLeftBehind() {
+    if (this._leftBehind) {
+      gsap.killTweensOf(this._leftBehind);
+      this.sm.scene.remove(this._leftBehind.points);
+      this._leftBehind.geo.dispose();
+      this._leftBehind.mat.dispose();
+      this._leftBehind = null;
+    }
   }
 
   _disposeMesh() {
     gsap.killTweensOf(this.data);
+    gsap.killTweensOf(this);
+    this._formBlendTween = null;
     if (this.points) {
       this.sm.scene.remove(this.points);
       if (this.geo) this.geo.dispose();
@@ -273,80 +328,124 @@ export class Particles {
     }
   }
 
-  // —— 每帧更新 —— //
+  // —— 每帧:curl 流场 + 生命周期生灭 + 鼠标局部排斥 + 基因调制 —— //
   update(dt) {
     this.time += dt;
 
-    // ambient 星场：uniform 时间 + 轻微旋转
+    // ambient 星场:uniform 时间 + 轻微旋转(保留)
     if (this._ambient) {
       this._ambient.mat.uniforms.uTime.value = this.time;
       this._ambient.points.rotation.y += dt * 0.01;
       this._ambient.points.rotation.x += dt * 0.004;
     }
 
+    // 余韵粒子:缓慢闪烁(保留)
+    if (this._leftBehind) {
+      this._leftBehind.mat.uniforms.uTime.value = this.time;
+      this._leftBehindPhase += dt;
+      const pts = this._leftBehind.points;
+      pts.rotation.y += dt * 0.05;
+      const breath = 0.65 + Math.sin(this._leftBehindPhase * 1.2) * 0.35;
+      const colAttr = this._leftBehind.geo.attributes.color;
+      const arr = colAttr.array;
+      const [br, bg, bb] = hslToRgb(this._leftBehind.baseHue, 0.6, 0.7);
+      const n = arr.length / 3;
+      for (let i = 0; i < n; i++) {
+        arr[i * 3] = br * breath;
+        arr[i * 3 + 1] = bg * breath;
+        arr[i * 3 + 2] = bb * breath;
+      }
+      colAttr.needsUpdate = true;
+    }
+
     if (!this.points) return;
     this.mat.uniforms.uTime.value = this.time;
 
+    const g = this.genes;
     const pos = this.geo.attributes.position.array;
     const col = this.geo.attributes.color.array;
     const alp = this.geo.attributes.aAlpha.array;
-    const m = this.mode;
+
+    // 基因调制出的全局参数
+    const flowK = g.flowSpeed * 26;
+    const regStrong = this._formBlend * (0.25 + g.density * 0.5);
+    const regFree = 0.05 * (1 - g.density * 0.4);
+    const regK = regStrong + regFree;
+    const damp = 0.88 + g.stability * 0.10;   // 0.88~0.98:稳定度高=速度衰减快=沉稳
+    const growthY = g.growthBias * 12;
+
+    // 鼠标世界点(每帧 unproject 一次)
+    this._updateMouseWorld();
+    const mw = this._mouseWorld;
+    const mouseOn = this._mouseActive;
+    const M_RADIUS = 190, M_RADIUS2 = M_RADIUS * M_RADIUS, M_FORCE = 180;
+
+    const dispersing = this._dispersing;
+    const lifeDecay = dispersing ? 2.2 : 1.0;  // 消散时生命加速
+    const ax = this.anchor.x, ay = this.anchor.y, az = this.anchor.z;
 
     for (let i = 0; i < this.data.length; i++) {
       const d = this.data[i];
 
-      if (m === "gather") {
-        // AI 延迟期间的"预演收缩"：粒子向中心缓慢聚拢（暗示"正在凝练"），不是无目的翻滚
-        // 缓慢减速向心 + 旋转下沉，让等待变成表演的一部分
-        const dist = Math.hypot(d.x, d.y, d.z) + 0.01;
-        // 向心拉力随时间增强（越等越聚拢，制造期待）
-        const pull = (40 + this.time * 4) * dt;
-        d.vx += (-d.x / dist) * pull;
-        d.vy += (-d.y / dist) * pull;
-        d.vz += (-d.z / dist) * pull;
-        d.vx *= 0.93; d.vy *= 0.93; d.vz *= 0.93;
-        // 缓慢切向旋转（让粒子云有"搅拌"感，不是直愣愣往中心撞）
-        d.vx += -d.z * 0.15 * dt;
-        d.vz += d.x * 0.15 * dt;
-        // 轻微噪声（保持有机感）
-        d.vx += Math.sin(this.time * 0.7 + d.seed) * 12 * dt;
-        d.vy += Math.cos(this.time * 0.8 + d.seed) * 12 * dt;
-        d.vz += Math.sin(this.time * 0.6 + d.seed * 1.3) * 12 * dt;
-        d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt;
-      } else if (m === "form") {
-        if (d.hasTarget) {
-          if (d.formT < 1) {
-            // 汇聚：用 formT 做 smoothstep 真插值（起点 sx/sy/sz → 目标 tx/ty/tz）
-            const t = d.formT;
-            const eased = t * t * (3 - 2 * t);
-            // 弧线路径：加一个垂直于行进方向的摆动，制造"旋入"感
-            const swing = (1 - eased) * 60 * Math.sin(eased * Math.PI);
-            const swx = Math.cos(d.seed * 3) * swing;
-            const swy = Math.sin(d.seed * 2.7) * swing;
-            const swz = Math.sin(d.seed * 3.1) * swing;
-            d.x = d.sx + (d.tx - d.sx) * eased + swx;
-            d.y = d.sy + (d.ty - d.sy) * eased + swy;
-            d.z = d.sz + (d.tz - d.sz) * eased + swz;
-          } else {
-            // 汇聚完成 → 按原型分发的特征运动（替代旧的 3.5 单位微抖）
-            this._breatheByArchetype(d);
-          }
+      // 1. curl 流场速度(每粒子加 curlOffset 让轨迹各异)
+      curl(this._tmp, d.x, d.y + d.curlOffset, d.z, 0.0028);
+      const cvx = this._tmp[0] * flowK;
+      const cvy = this._tmp[1] * flowK;
+      const cvz = this._tmp[2] * flowK;
+
+      // 2. 弱回归(围绕锚点;成型时强,自由时弱;防飘散到无穷远)
+      const rx = (ax - d.x) * regK;
+      const ry = (ay - d.y) * regK + growthY;
+      const rz = (az - d.z) * regK;
+
+      // 3. 鼠标局部排斥(teamLab 式:手过处粒子被拨开)
+      let mfx = 0, mfy = 0, mfz = 0;
+      if (mouseOn) {
+        const dx = d.x - mw.x, dy = d.y - mw.y, dz = d.z - mw.z;
+        const d2 = dx * dx + dy * dy + dz * dz;
+        if (d2 < M_RADIUS2 && d2 > 0.01) {
+          const dist = Math.sqrt(d2);
+          const f = (1 - dist / M_RADIUS) * M_FORCE;
+          const inv = 1 / dist;
+          mfx = dx * inv * f; mfy = dy * inv * f; mfz = dz * inv * f;
         }
       }
-      // disperse：GSAP 直接驱动 x/y/z/alpha
 
-      pos[i * 3] = d.x;
-      pos[i * 3 + 1] = d.y;
-      pos[i * 3 + 2] = d.z;
+      // 4. 积分(速度 → 位置,带阻尼)
+      d.vx = (d.vx + (cvx + rx + mfx) * dt) * damp;
+      d.vy = (d.vy + (cvy + ry + mfy) * dt) * damp;
+      d.vz = (d.vz + (cvz + rz + mfz) * dt) * damp;
 
-      // 颜色：随 alpha 调亮（消散时变暗），保持目标色
-      const k = d.alpha;
-      col[i * 3] = d.color.r * k;
-      col[i * 3 + 1] = d.color.g * k;
-      col[i * 3 + 2] = d.color.b * k;
-      alp[i] = 1; // 用 vertexColor 乘 alpha 体现明暗；aAlpha 通道保持 1（颜色已含 k）
-      // 说明：着色器里 vAlpha=aAlpha，这里把"亮度"塞进 color，aAlpha 维持 1，
-      // 这样消散时是"变暗淡出"而非"整点消失"，更柔和。
+      // 消散:额外离心外飘
+      if (dispersing) {
+        const dl = Math.hypot(d.x, d.y, d.z) || 1;
+        const inv = 1 / dl;
+        d.vx += d.x * inv * 40 * dt;
+        d.vy += d.y * inv * 40 * dt;
+        d.vz += d.z * inv * 40 * dt;
+      }
+
+      d.x += d.vx * dt;
+      d.y += d.vy * dt;
+      d.z += d.vz * dt;
+
+      // 5. 生命周期(生灭):淡入→盛→淡出→重生 / 消散时停在末端 + maxAlpha 衰减
+      d.life += d.lifeSpeed * dt * lifeDecay;
+      let lm;
+      if (d.life >= 1) {
+        if (dispersing) { d.life = 1; d.maxAlpha *= 0.965; lm = 0; }
+        else { d.life = 0; d.curlOffset = Math.random() * 100; lm = 0; }
+      } else {
+        lm = d.life < 0.2 ? d.life / 0.2 : d.life > 0.8 ? 1 - (d.life - 0.8) / 0.2 : 1;
+      }
+      const a = lm * d.maxAlpha;
+
+      // 6. 写 buffer(亮度走 color,aAlpha 保持 1——沿用原约定,不动 frag shader)
+      pos[i * 3] = d.x; pos[i * 3 + 1] = d.y; pos[i * 3 + 2] = d.z;
+      col[i * 3] = d.color.r * a;
+      col[i * 3 + 1] = d.color.g * a;
+      col[i * 3 + 2] = d.color.b * a;
+      alp[i] = 1;
     }
 
     this.geo.attributes.position.needsUpdate = true;
@@ -354,74 +453,11 @@ export class Particles {
     this.geo.attributes.aAlpha.needsUpdate = true;
   }
 
-  // —— 六大原型各自的"活着"方式（替代旧的统一微抖）—— //
-  // d.baseR / baseAng / basePhi 是 formTo 时存的极坐标；围绕锚点做特征运动
-  _breatheByArchetype(d) {
-    const t = this.time;
-    switch (this.archetype) {
-      case "vortex": {
-        // 集体绕 Y 轴旋转（双臂真的转起来）：角度随时间推进，半径不变
-        const ang = d.baseAng + t * 0.3;
-        const r = d.baseR;
-        const yJit = Math.sin(t * 0.8 + d.seed) * 4;
-        d.x = r * Math.sin(d.basePhi) * Math.cos(ang);
-        d.y = d.by + yJit;
-        d.z = r * Math.sin(d.basePhi) * Math.sin(ang);
-        break;
-      }
-      case "bloom": {
-        // 花瓣开合：半径随"花瓣相位"呼吸（6 瓣张合）
-        const petalPhase = Math.sin(d.baseAng * 6) * 0.18; // 瓣的位置调制
-        const breatheR = d.baseR * (1 + petalPhase * Math.sin(t * 0.7));
-        const ang = d.baseAng;
-        const phi = d.basePhi;
-        d.x = breatheR * Math.sin(phi) * Math.cos(ang);
-        d.y = breatheR * Math.cos(phi);
-        d.z = breatheR * Math.sin(phi) * Math.sin(ang);
-        break;
-      }
-      case "cascade": {
-        // 持续向下流：y 随时间递减，到底部循环回顶部（瀑布感）
-        const flow = (t * 45 + d.seed * 80) % 180; // 流动距离周期
-        const range = 420; // 形态纵向范围
-        let yOff = (flow - 90); // -90 ~ +90
-        // 映射到形态内：让粒子在 by 附近上下流动
-        d.x = d.bx + Math.sin(t * 0.6 + d.seed) * 5;
-        d.y = d.by + Math.sin(yOff * Math.PI / 180) * range * 0.4 - yOff * 0.3;
-        d.z = d.bz + Math.cos(t * 0.5 + d.seed) * 4;
-        break;
-      }
-      case "aurora": {
-        // 波浪相位推进：sin 波随 time 沿 x 移动（光帘飘动）
-        const wavePhase = d.bx * 0.02 + t * 0.8;
-        const waveAmp = 70;
-        d.x = d.bx + Math.sin(t * 0.4 + d.seed) * 3;
-        d.y = d.by + Math.sin(t * 0.5 + d.seed) * 4;
-        d.z = d.bz + Math.sin(wavePhase) * waveAmp - Math.sin(d.bx * 0.02) * waveAmp;
-        break;
-      }
-      case "crystal": {
-        // 几乎静止 + 极缓自转（展示棱角，强调锐利不糊）
-        const ang = d.baseAng + t * 0.06;
-        const r = d.baseR;
-        d.x = r * Math.sin(d.basePhi) * Math.cos(ang);
-        d.y = d.by; // y 不动，保持棱角清晰
-        d.z = r * Math.sin(d.basePhi) * Math.sin(ang);
-        break;
-      }
-      case "nebula":
-      default: {
-        // 星云：整体半径呼吸（±8%）+ 内部絮流
-        const breathe = 1 + Math.sin(t * 0.5 + d.seed * 0.5) * 0.08;
-        const r = d.baseR * breathe;
-        const ang = d.baseAng + Math.sin(t * 0.2 + d.seed) * 0.15;
-        const phi = d.basePhi + Math.cos(t * 0.25 + d.seed * 1.3) * 0.1;
-        d.x = r * Math.sin(phi) * Math.cos(ang);
-        d.y = r * Math.cos(phi);
-        d.z = r * Math.sin(phi) * Math.sin(ang);
-        break;
-      }
-    }
+  // 鼠标 NDC → 世界点(unproject 到相机前方中间深度 ≈ 粒子云)。y 翻转适配 WebGL NDC。
+  _updateMouseWorld() {
+    if (!Input.hasMoved) { this._mouseActive = false; return; }
+    this._mouseActive = true;
+    this._mouseWorld.set(Input.x, -Input.y, 0.5).unproject(this.sm.camera);
   }
 
   hasParticles() {
@@ -430,6 +466,8 @@ export class Particles {
 
   dispose() {
     this._disposeMesh();
+    this._clearLeftBehind();
+    if (this._ambientTint) { gsap.killTweensOf(this._ambientTint); this._ambientTint = null; }
     if (this._ambient) {
       this.sm.scene.remove(this._ambient.points);
       this._ambient.geo.dispose();

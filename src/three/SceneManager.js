@@ -31,7 +31,9 @@ export class SceneManager {
     this.camera.lookAt(0, 0, 0);
 
     // 渲染器
-    this.renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+    // antialias:false —— EffectComposer 渲染到非 MSAA 的 render target,renderer 的 MSAA 不作用于最终画面,
+    // 开着只白白多耗一份显存/时间。边缘锯齿由 Bloom 柔化 + 圆形 discard 点本就无硬边,可接受。
+    this.renderer = new THREE.WebGLRenderer({ alpha: true, antialias: false });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.setSize(W, H);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -46,8 +48,11 @@ export class SceneManager {
       new EffectPass(
         this.camera,
         new BloomEffect({
-          intensity: 1.15,
-          luminanceThreshold: 0.18,
+          // threshold 提至 0.3:原 0.18 太低,Additive 叠加下几乎所有粒子都过阈值,
+          // Bloom 等价全屏重绘且过曝,会糊掉 crystal 棱/aurora 帘/nebula-vs-bloom 的结构差异
+          // (正是"形态无区别"历史 bug 的残留风险)。intensity 配合略降至 1.0。
+          intensity: 1.0,
+          luminanceThreshold: 0.3,
           luminanceSmoothing: 0.14,
           mipmapBlur: true,
         })

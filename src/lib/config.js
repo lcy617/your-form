@@ -8,8 +8,11 @@ export const CONFIG = {
    */
   workerUrl: "https://magician.1692664808.workers.dev",
 
-  /** 调用超时（ms）。超时走 fallback。qwen3.7-plus 是推理模型，给宽点。 */
+  /** reveal(读心)调用超时（ms）。超时走 fallback。qwen3.7-plus 是推理模型，给宽点。 */
   aiTimeoutMs: 20000,
+
+  /** greet(招呼)调用超时（ms）。招呼是一句话,不需要推理模型那么久;超时短,避免 act2 卡顿感。 */
+  greetTimeoutMs: 8000,
 
   /** 通义模型名。qwen3.7-plus 推理质量好且有 100w 免费 token；qwen-turbo 更快更便宜但免费额度常已耗尽。 */
   model: "qwen3.7-plus",

@@ -11,6 +11,7 @@
 //   aurora  起伏光帘     —— 梦境/超脱
 
 import * as THREE from "three";
+import { hslToRgb } from "../lib/color.js";
 
 // —— 合法原型白名单（ai.js 解析时也用同一份）—— //
 export const ARCHETYPES = ["nebula", "vortex", "bloom", "cascade", "crystal", "aurora"];
@@ -26,30 +27,7 @@ function gaussian() {
   return Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
 }
 
-// —— 工具：HSL→RGB，返回 [0~1] —— //
-function hslToRgb(h, s, l) {
-  // h: 0~360, s/l: 0~1
-  h = ((h % 360) + 360) % 360 / 360;
-  let r, g, b;
-  if (s === 0) {
-    r = g = b = l;
-  } else {
-    const hue2rgb = (p, q, t) => {
-      if (t < 0) t += 1;
-      if (t > 1) t -= 1;
-      if (t < 1 / 6) return p + (q - p) * 6 * t;
-      if (t < 1 / 2) return q;
-      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-      return p;
-    };
-    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-    const p = 2 * l - q;
-    r = hue2rgb(p, q, h + 1 / 3);
-    g = hue2rgb(p, q, h);
-    b = hue2rgb(p, q, h - 1 / 3);
-  }
-  return [r, g, b];
-}
+// hslToRgb 已抽到 lib/color.js（与 particles.js 共用，消除重复实现）
 
 // —— 主色（hue）+ 能量派生饱和度/明度 + 每粒子抖动 —— //
 function colorFor(hue, energy, i) {
@@ -205,7 +183,8 @@ function genCrystal(count, hue, energy) {
   }
 
   // 把粒子均分到各条边上，沿边随机分布 + 少量体心粒子
-  const perEdge = Math.floor(count * 0.85 / edges.length);
+  // perEdge 下限保护:count 很小时保证每条边至少 2 粒子,避免晶格退化成稀疏点云
+  const perEdge = Math.max(2, Math.floor(count * 0.85 / edges.length));
   let idx = 0;
   for (const [a, b] of edges) {
     for (let k = 0; k < perEdge && idx < count; k++, idx++) {

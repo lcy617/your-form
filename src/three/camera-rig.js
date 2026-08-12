@@ -8,6 +8,7 @@
 
 import * as THREE from "three";
 import gsap from "gsap";
+import { Input } from "../lib/input.js";
 
 export class CameraRig {
   constructor(camera) {
@@ -25,18 +26,12 @@ export class CameraRig {
     this._tHeight = 0;
     this._tAngleSpeed = 0.02;
 
-    // mouse parallax（轻量视差）
+    // mouse parallax（轻量视差）—— 鼠标源改用共享 lib/input.js
+    // (粒子也读它做 teamLab 式响应;避免 camera-rig 与 particles 各挂一套 window 监听)
     this._mx = 0;
     this._my = 0;
     this._tmx = 0;
     this._tmy = 0;
-    this._onMove = (e) => {
-      const t = e.touches ? e.touches[0] : e;
-      this._tmx = (t.clientX / window.innerWidth - 0.5) * 2;
-      this._tmy = (t.clientY / window.innerHeight - 0.5) * 2;
-    };
-    window.addEventListener("mousemove", this._onMove, { passive: true });
-    window.addEventListener("touchmove", this._onMove, { passive: true });
 
     this._sync();
   }
@@ -103,6 +98,9 @@ export class CameraRig {
     this.height += (this._tHeight - this.height) * Math.min(1, dt * 1.6);
     this.angleSpeed += (this._tAngleSpeed - this.angleSpeed) * Math.min(1, dt * 1.2);
 
+    // 鼠标源从共享 Input 读(particles 也读它)
+    this._tmx = Input.x;
+    this._tmy = Input.y;
     // 鼠标视差平滑
     this._mx += (this._tmx - this._mx) * Math.min(1, dt * 2.5);
     this._my += (this._tmy - this._my) * Math.min(1, dt * 2.5);
@@ -121,8 +119,7 @@ export class CameraRig {
   }
 
   dispose() {
-    window.removeEventListener("mousemove", this._onMove);
-    window.removeEventListener("touchmove", this._onMove);
+    // 鼠标监听已移到 lib/input.js,由 App.vue 统一 start/stop,这里不再解绑
     gsap.killTweensOf(this);
   }
 
